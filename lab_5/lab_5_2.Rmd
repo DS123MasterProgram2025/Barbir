@@ -1,0 +1,282 @@
+---
+title: "Лабораторна робота № 6. Побудова моделей класифікації ІІ. Пакет tidymodels"
+author: 'Barbir Vladyslav'
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+  html_notebook:
+    toc: true
+    toc_float: true
+    number_sections: true
+editor_options:
+  chunk_output_type: inline
+encoding: "UTF-8"
+---
+**Мета:** *Засвоєння базових принципів, знайомство з інструментами та набуття навичок побудови, eкспорту та імпорту моделей класифікації на рівні технології на основі статистичного підходу та моделей машинного навчання засобами мови програмування R та за допомогою універсального інтерфейсу доступа до функцій машинного навчання пакету `tidymodels`.*
+
+## Хід роботи
+
+### Виконання завдання
+
+#### **Підготовка середовища та розвідувальний аналіз даних**
+
+Спочатку завантажимо всі необхідні бібліотеки та дані.
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(mlbench)
+library(DBI)
+library(RSQLite)
+library(ranger)
+library(corrplot)
+library(patchwork)
+
+```
+
+Завантажимо та проведемо короткий розвідувальний аналіз даних (`EDA`).
+
+```{r}
+data(PimaIndiansDiabetes)
+diabetes_orig <- as_tibble(PimaIndiansDiabetes)
+
+glimpse(diabetes_orig)
+summary(diabetes_orig)
+
+diabetes_processed <- diabetes_orig %>%
+  mutate(across(c(glucose, pressure, triceps, insulin, mass), ~na_if(., 0)))
+
+colSums(is.na(diabetes_processed))
+
+ggplot(diabetes_processed, aes(x = diabetes)) +
+  geom_bar(fill = "skyblue") +
+  labs(title = "Розподіл цільової змінної 'diabetes'")
+
+```
+
+#### **Побудова моделі Випадкового Лісу** 
+
+- **Крок 1: Розділення даних**
+
+Розділимо дані на тренувальну (`training`) та тестову (`testing`) вибірки для об'єктивної оцінки моделі.
+
+```{r}
+set.seed(123) 
+diabetes_split <- initial_split(diabetes_processed, prop = 0.75, strata = diabetes)
+
+diabetes_train <- training(diabetes_split)
+diabetes_test <- testing(diabetes_split)
+```
+
+- **Крок 2: Створення "рецепту" для попередньої обробки**
+
+Рецепт (`recipe`) визначає кроки обробки даних, які будуть застосовані до тренувальної та тестової вибірок. Ми заповнимо пропущені значення (`impute`) та нормалізуємо числові предиктори.
+
+```{r}
+diabetes_recipe <- recipe(diabetes ~ ., data = diabetes_train) %>%
+  step_impute_knn(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+summary(prep(diabetes_recipe))
+```
+
+- **Крок 3: Специфікація моделі**
+
+Визначимо тип моделі, яку ми хочемо навчити. У нашому випадку це модель випадкового лісу (`rand_forest`).
+
+```{r}
+rf_spec <- rand_forest(trees = 1000) %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("classification")
+
+rf_spec
+```
+
+- **Крок 4: Створення робочого процесу (`Workflow`)**
+
+Об'єднаємо рецепт та специфікацію моделі в єдиний об'єкт `workflow`. Це спрощує процес навчання та прогнозування.
+
+```{r}
+rf_workflow <- workflow() %>%
+  add_recipe(diabetes_recipe) %>%
+  add_model(rf_spec)
+
+rf_workflow
+```
+
+- **Крок 5: Навчання моделі** 
+
+Тепер "підженемо" (`fit`) наш робочий процес під тренувальні дані.
+
+```{r}
+rf_fit <- rf_workflow %>%
+  fit(data = diabetes_train)
+```
+
+- **Крок 6: Оцінка моделі** 
+
+Оцінимо якість навченої моделі на тестових даних, які вона ще не бачила.
+
+```{r}
+diabetes_preds <- predict(rf_fit, diabetes_test) %>%
+  bind_cols(predict(rf_fit, diabetes_test, type = "prob")) %>%
+  bind_cols(diabetes_test %>% select(diabetes))
+
+conf_mat(diabetes_preds, truth = diabetes, estimate = .pred_class)
+
+metrics(diabetes_preds, truth = diabetes, estimate = .pred_class)
+```
+
+#### **Експорт та імпорт моделі через реляційну БД** 
+
+- **Крок 1: Серіалізація та експорт моделі** 
+
+Збережемо навчений об'єкт `rf_fit` у файл, а потім завантажимо його в базу даних `SQLite` як бінарний об'єкт (`BLOB`).
+
+```{r}
+model_blob <- serialize(rf_fit, connection = NULL)
+
+db_conn <- dbConnect(RSQLite::SQLite(), "models_database.db")
+
+dbExecute(db_conn, "
+  CREATE TABLE IF NOT EXISTS models (
+    model_name TEXT PRIMARY KEY,
+    model_object BLOB
+  )
+")
+
+dbExecute(db_conn, "DELETE FROM models WHERE model_name = 'pima_random_forest'")
+
+df_to_write <- tibble(
+  model_name = "pima_random_forest",
+  model_object = list(model_blob)
+)
+
+dbAppendTable(db_conn, "models", df_to_write)
+
+dbDisconnect(db_conn)
+
+print("Модель 'pima_random_forest' успішно експортована в базу даних (надійним способом).")
+```
+
+- **Крок 2: Імпорт моделі та перевірка працездатності**
+
+Тепер виконаємо зворотний процес: завантажимо модель з БД, десеріалізуємо її та перевіримо, чи працює вона.
+
+```{r}
+db_conn <- dbConnect(RSQLite::SQLite(), "models_database.db")
+
+model_retrieved_df <- dbGetQuery(
+  db_conn,
+  "SELECT model_object FROM models WHERE model_name = 'pima_random_forest'"
+)
+
+raw_vector <- model_retrieved_df$model_object[[1]]
+
+imported_rf_model <- unserialize(raw_vector)
+
+dbDisconnect(db_conn)
+
+print("Модель успішно імпортована з бази даних.")
+
+predict(imported_rf_model, diabetes_test[1, ])
+```
+
+#### **Робота з датасетом `palmerpenguins`**
+
+- **Побудова моделей (Випадковий Ліс та Логістична Регресія)**
+
+Повторимо аналогічні кроки для датасету `palmerpenguins`, де ми будемо класифікувати вид пінгвіна.
+
+```{r}
+library(palmerpenguins)
+
+penguins_df <- penguins %>%
+  filter(!is.na(sex)) %>%
+  select(-island) 
+
+set.seed(456)
+penguin_split <- initial_split(penguins_df, prop = 0.8, strata = species)
+penguin_train <- training(penguin_split)
+penguin_test <- testing(penguin_split)
+
+penguin_recipe <- recipe(species ~ ., data = penguin_train) %>%
+  step_dummy(all_nominal_predictors()) %>% 
+  step_normalize(all_numeric_predictors())
+
+rf_spec_pen <- rand_forest(trees = 500) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+log_reg_spec <- multinom_reg() %>%
+  set_engine("nnet") %>%
+  set_mode("classification")
+
+rf_workflow_pen <- workflow() %>% add_recipe(penguin_recipe) %>% add_model(rf_spec_pen)
+log_reg_workflow <- workflow() %>% add_recipe(penguin_recipe) %>% add_model(log_reg_spec)
+
+rf_fit_pen <- fit(rf_workflow_pen, data = penguin_train)
+log_reg_fit <- fit(log_reg_workflow, data = penguin_train)
+
+preds_rf_pen <- predict(rf_fit_pen, penguin_test) %>%
+  bind_cols(penguin_test %>% select(species))
+metrics(preds_rf_pen, truth = species, estimate = .pred_class)
+
+preds_log_reg <- predict(log_reg_fit, penguin_test) %>%
+  bind_cols(penguin_test %>% select(species))
+metrics(preds_log_reg, truth = species, estimate = .pred_class)
+```
+
+- **Експорт моделей penguins**
+
+Збережемо обидві моделі в ту саму базу даних, але під різними іменами.
+
+```{r}
+rf_blob_pen <- serialize(rf_fit_pen, connection = NULL)
+log_reg_blob_pen <- serialize(log_reg_fit, connection = NULL)
+
+df_to_write_pen <- tibble::tibble(
+  model_name = c("penguins_random_forest", "penguins_logistic_regression"),
+  model_object = list(rf_blob_pen, log_reg_blob_pen) # <-- Пакуємо бінарні дані у список
+)
+
+db_conn <- dbConnect(RSQLite::SQLite(), "models_database.db")
+
+dbExecute(db_conn, "DELETE FROM models WHERE model_name = 'penguins_random_forest'")
+dbExecute(db_conn, "DELETE FROM models WHERE model_name = 'penguins_logistic_regression'")
+
+dbAppendTable(db_conn, "models", df_to_write_pen)
+
+dbDisconnect(db_conn)
+
+print("Моделі для датасету penguins успішно експортовані.")
+
+```
+
+- **Імпорт моделей penguins**
+
+```{r}
+db_conn <- dbConnect(RSQLite::SQLite(), "models_database.db")
+
+retrieved_df_pen <- dbGetQuery(
+  db_conn, 
+  "SELECT model_object FROM models WHERE model_name = 'penguins_random_forest'"
+)
+
+dbDisconnect(db_conn)
+
+raw_vector_pen <- retrieved_df_pen$model_object[[1]]
+
+imported_penguin_model <- unserialize(raw_vector_pen)
+
+print("Модель 'penguins_random_forest' успішно імпортована.")
+
+predict(imported_penguin_model, penguin_test[1:5, ])
+```
+## References
+1. James, G., Witten, D., Hastie, T., & Tibshirani, R. (2023). *An Introduction to Statistical Learning: with Applications in R (3rd ed.)*. Springer.  
+2. Wickham, H., & Grolemund, G. (2017). *R for Data Science: Import, Tidy, Transform, Visualize, and Model Data*. O’Reilly Media.  
+3. Kuhn, M., & Silge, J. (2022). *Tidy Modeling with R*. O’Reilly Media.  
+4. Han, J., Pei, J., & Kamber, M. (2022). *Data Mining: Concepts and Techniques (4th ed.)*. Morgan Kaufmann.  
